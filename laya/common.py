@@ -128,29 +128,129 @@ def build_sequence(
     return ids[:max_len], [m for m in markers if m < max_len]
 
 
-class DecisionModel(nn.Module):
-    """Bidirectional transformer encoder backbone + typed decision head."""
+class CrossAttentionLayer(nn.Module):
+    """Decision-token block: learned-query cross-attention over the encoder's state tokens, then a
+    position-wise feed-forward. The decision tokens do not attend to each other.
 
-    def __init__(self, encoder: nn.Module, head_layers: int = 2, n_act: int = 2, dropout: float = 0.1):
+    ``nn.MultiheadAttention`` costs ``4 * d**2`` whether query and key/value are the same tensor or
+    not, so this layer has exactly the parameter count of one ``nn.TransformerEncoderLayer`` at the
+    same width and feed-forward size. Head count does not enter the count either -- it only sets the
+    per-head width -- so a 4-head cross-attention stage and the shipped 12-head self-attention stage
+    are parameter-matched by construction. ``tests/test_cross_attention_head.py`` asserts it.
+    """
+
+    def __init__(self, d_model: int, nhead: int, dim_feedforward: int, dropout: float = 0.1):
         super().__init__()
+        self.cross_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout, batch_first=True)
+        self.linear1 = nn.Linear(d_model, dim_feedforward)
+        self.linear2 = nn.Linear(dim_feedforward, d_model)
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.dropout = nn.Dropout(dropout)
+        self.dropout1 = nn.Dropout(dropout)
+        self.dropout2 = nn.Dropout(dropout)
+        self.activation = nn.GELU()
+
+    def forward(self, q: torch.Tensor, kv: torch.Tensor,
+                kv_pad_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        attn, _ = self.cross_attn(q, kv, kv, key_padding_mask=kv_pad_mask, need_weights=False)
+        x = self.norm1(q + self.dropout1(attn))
+        return self.norm2(x + self.dropout2(self.linear2(self.dropout(self.activation(self.linear1(x))))))
+
+
+class CrossAttentionHead(nn.Module):
+    """``num_layers`` cross-attention blocks, every one reading the same encoded state tokens.
+
+    Exposes ``.layers`` like ``nn.TransformerEncoder`` so the checkpointing loop in
+    ``DecisionModel.forward`` is shared rather than duplicated.
+    """
+
+    def __init__(self, d_model: int, nhead: int, dim_feedforward: int, num_layers: int,
+                 dropout: float = 0.1):
+        super().__init__()
+        self.layers = nn.ModuleList(
+            CrossAttentionLayer(d_model, nhead, dim_feedforward, dropout) for _ in range(num_layers))
+
+    def forward(self, q: torch.Tensor, kv: torch.Tensor,
+                kv_pad_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        for layer in self.layers:
+            q = layer(q, kv, kv_pad_mask)
+        return q
+
+
+HEAD_KINDS = ("self_attention", "cross_attention")
+
+
+class DecisionModel(nn.Module):
+    """Bidirectional transformer encoder backbone + typed decision head.
+
+    ``head_kind`` selects the aggregation path and defaults to the shipped one, so nothing that
+    does not ask for it changes behaviour:
+
+    ``"self_attention"``   the shipped head: a ``nn.TransformerEncoder`` over the *whole flat
+                           sequence* -- decision tokens and state tokens together.
+    ``"cross_attention"``  a cross-attention stage in which the decision tokens (``[CLS]``,
+                           instruction block and option markers) are the queries and **every**
+                           encoded state token is a key/value pair, so each marker reaches all
+                           ``n`` state positions in one hop instead of routing through the head's
+                           layers while competing with the filler for attention mass.
+
+    Only the aggregation changes. ``type_emb``, ``scorer``, ``act_head`` and ``temperature`` are
+    the same modules in both, and the marker gather and scoring path below is untouched.
+    """
+
+    def __init__(self, encoder: nn.Module, head_layers: int = 2, n_act: int = 2, dropout: float = 0.1,
+                 head_kind: str = "self_attention", head_nhead: Optional[int] = None):
+        super().__init__()
+        if head_kind not in HEAD_KINDS:
+            raise ValueError("head_kind must be one of %s, got %r" % (HEAD_KINDS, head_kind))
         self.encoder = encoder
+        self.head_kind = head_kind
         d = encoder.config.hidden_size
-        nhead = max(1, d // 64)
-        layer = nn.TransformerEncoderLayer(d, nhead, 4 * d, dropout, batch_first=True, norm_first=True)
-        self.head = nn.TransformerEncoder(layer, head_layers, enable_nested_tensor=False) if head_layers > 0 else None
+        nhead = head_nhead or max(1, d // 64)
+        if head_kind == "self_attention":
+            layer = nn.TransformerEncoderLayer(d, nhead, 4 * d, dropout, batch_first=True, norm_first=True)
+            self.head = nn.TransformerEncoder(layer, head_layers, enable_nested_tensor=False) if head_layers > 0 else None
+        else:
+            self.head = CrossAttentionHead(d, nhead, 4 * d, head_layers, dropout) if head_layers > 0 else None
         self.type_emb = nn.Embedding(3, d)
         self.scorer = nn.Sequential(nn.LayerNorm(d), nn.Linear(d, d), nn.GELU(), nn.Linear(d, 1))
         self.act_head = nn.Sequential(nn.Linear(d + 4, 256), nn.GELU(), nn.Linear(256, n_act))
         self.register_buffer("temperature", torch.ones(3))
         self.head_checkpointing = False
 
-    def forward(self, input_ids, attention_mask, marker_pos, marker_mask, qtype, detach_encoder: bool = False):
+    def _state_start(self, input_ids, marker_pos, marker_mask, state_start):
+        """First state position per row: the token after the ``[SEP]`` that closes the option block.
+
+        Callers that build the sequence themselves know this exactly and should pass it (the H5
+        harness does). The fallback locates the first ``sep_token_id`` after the last valid marker,
+        which is the same position as long as no option text tokenizes to the separator id -- true
+        for the ids in play here, where ``sep_token_id == cls_token_id == 1`` and position 0 is
+        excluded because it precedes the markers.
+        """
+        if state_start is not None:
+            return state_start
+        sep_id = getattr(self.encoder.config, "sep_token_id", None)
+        if sep_id is None:
+            raise ValueError(
+                "cross_attention head needs a state boundary: pass state_start explicitly, or use an "
+                "encoder config that carries sep_token_id")
+        last = torch.where(marker_mask, marker_pos.clamp(min=0),
+                           torch.full_like(marker_pos, -1)).max(dim=1).values
+        pos = torch.arange(input_ids.size(1), device=input_ids.device)[None, :].expand_as(input_ids)
+        is_sep_after = (input_ids == sep_id) & (pos > last[:, None])
+        big = input_ids.size(1) + 1
+        first = torch.where(is_sep_after, pos, torch.full_like(pos, big)).min(dim=1).values
+        return (first + 1).clamp(max=input_ids.size(1))
+
+    def forward(self, input_ids, attention_mask, marker_pos, marker_mask, qtype,
+                detach_encoder: bool = False, state_start: Optional[torch.Tensor] = None):
         h = self.encoder(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state
         if detach_encoder:
             h = h.detach()
         h = h + self.type_emb(qtype)[:, None, :]
-        if self.head is not None:
-            pad = ~attention_mask.bool()
+        pad = ~attention_mask.bool()
+        if self.head is not None and self.head_kind == "self_attention":
             for layer in self.head.layers:
                 if self.head_checkpointing and self.training and torch.is_grad_enabled():
                     # Non-reentrant checkpointing also trains the head when its input
@@ -158,6 +258,19 @@ class DecisionModel(nn.Module):
                     h = checkpoint(layer, h, src_key_padding_mask=pad, use_reentrant=False)
                 else:
                     h = layer(h, src_key_padding_mask=pad)
+        elif self.head is not None:
+            start = self._state_start(input_ids, marker_pos, marker_mask, state_start)
+            dmax = int(start.max().item())
+            pos = torch.arange(h.size(1), device=h.device)[None, :]
+            # Only *state* tokens are keys and values: masking the decision block on the key side
+            # is what makes this a cross-attention over the document rather than a second round of
+            # self-attention over the prompt.
+            kv_pad = pad | (pos < start[:, None])
+            q = self.head(h[:, :dmax], h, kv_pad)
+            # Every decision position lies below its row's own state_start, so writing the whole
+            # padded query block back is safe: positions at or past state_start are state tokens
+            # that the marker gather below never reads.
+            h = torch.cat([q, h[:, dmax:]], dim=1)
         idx = marker_pos.clamp(min=0)[:, :, None].expand(-1, -1, h.size(-1))
         m = torch.gather(h, 1, idx)
         logits = self.scorer(m).squeeze(-1).float()
@@ -215,7 +328,9 @@ def build_model(cfg: Dict, encoder_dir: Optional[str] = None, pretrained: bool =
         enc = AutoModel.from_config(ecfg, attn_implementation="sdpa")
     else:
         enc = AutoModel.from_pretrained(cfg["encoder"], attn_implementation="sdpa")
-    return DecisionModel(enc, cfg.get("head_layers", 2), len(cfg.get("act_costs", {})) + 1)
+    return DecisionModel(enc, cfg.get("head_layers", 2), len(cfg.get("act_costs", {})) + 1,
+                         head_kind=cfg.get("head_kind", "self_attention"),
+                         head_nhead=cfg.get("head_nhead"))
 
 
 def proper_reward(

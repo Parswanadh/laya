@@ -39,13 +39,13 @@ def check_true(name, cond, detail=""):
         FAIL.append("%s %s" % (name, detail))
 
 
-def _tiny(head_kind="self_attention", head_nhead=None, head_layers=2):
+def _tiny(head_kind="self_attention", head_nhead=None, head_layers=2, cross_nhead=None):
     cfg = AutoConfig.for_model(
         "bert", hidden_size=64, num_hidden_layers=1, num_attention_heads=4,
         intermediate_size=128, vocab_size=64, sep_token_id=3,
     )
     model = DecisionModel(AutoModel.from_config(cfg), head_layers=head_layers, n_act=2,
-                          head_kind=head_kind, head_nhead=head_nhead)
+                          head_kind=head_kind, head_nhead=head_nhead, cross_nhead=cross_nhead)
     model.eval()
     return model
 
@@ -153,10 +153,22 @@ l_a, _ = m2(ids, att, mpos, mmask, qtype)
 l_b, _ = m2(ids, att, mpos, mmask, qtype, state_start=torch.full((2,), 10, dtype=torch.long))
 check_true("compat/self_attention ignores state_start and is deterministic",
            torch.allclose(l_a, l_b, atol=1e-6))
-check_true("compat/HEAD_KINDS lists exactly the shipped and the new path",
-           HEAD_KINDS == ("self_attention", "cross_attention"), str(HEAD_KINDS))
+check_true("compat/HEAD_KINDS lists the shipped path, the replacement and the parallel addition",
+           HEAD_KINDS == ("self_attention", "cross_attention", "self_attention_plus_cross"),
+           str(HEAD_KINDS))
 
-# ------------------------------------------------------------------ 4. training path
+# ------------------------------------------------------------------ 4. the cached-feature path
+# A training loop that caches the frozen encoder's output once and reuses it across epochs must go
+# through this same head, or it measures a different aggregation from the one the model ships.
+with torch.no_grad():
+    tiny = _tiny("cross_attention", head_nhead=4)
+    raw = tiny.encoder(input_ids=ids, attention_mask=att).last_hidden_state
+l_direct, _ = tiny(ids, att, mpos, mmask, qtype, state_start=start)
+l_cached, _ = tiny(ids, att, mpos, mmask, qtype, state_start=start, encoder_hidden=raw)
+check_true("cache/encoder_hidden reproduces the direct forward exactly",
+           torch.allclose(l_direct, l_cached, atol=1e-6), "cached and direct paths disagree")
+
+# ------------------------------------------------------------------ 5. training path
 m3 = _tiny("cross_attention", head_nhead=4)
 m3.train()
 encoder_frozen = all(not p.requires_grad for p in m3.encoder.parameters())
@@ -169,6 +181,104 @@ grads = {n: (p.grad is not None and bool(p.grad.abs().sum() > 0))
 check_true("train/gradients reach every cross-attention layer",
            all(grads["head.layers.%d.cross_attn.in_proj_weight" % i] for i in range(2)), str(grads))
 check_true("train/gradients reach the scorer", grads["scorer.1.weight"])
+
+# ------------------------------------------- 6. the parallel addition is the identity at init
+# `head_kind="self_attention_plus_cross"` must be *bit-for-bit* the shipped path until the branch's
+# zero-initialised output projection moves. This is the property the H5 arm-3 re-run rests on: it is
+# what makes a later gain attributable to the architecture rather than to a fresh module's
+# initialisation. `torch.equal`, not `allclose` -- a near-identity would already be a different
+# starting point from the arm it is compared against.
+def _share_weights(src, dst):
+    """Copy every tensor the two architectures have in common (the shipped head, type_emb, scorer,
+    act head and temperature); the added branch is left at its own initialisation."""
+    s, o = src.state_dict(), dst.state_dict()
+    for k, v in o.items():
+        if k in s and s[k].shape == v.shape and not k.startswith("cross."):
+            o[k] = s[k].clone()
+    dst.load_state_dict(o)
+
+
+# the shipped-path model must carry the *same* self-attention geometry as the plus-model:
+# d=64 -> 1 head by default, while the branch runs 4
+plain = _tiny("self_attention")
+plus = _tiny("self_attention_plus_cross", cross_nhead=4)
+_share_weights(plain, plus)
+with torch.no_grad():
+    l_plain, a_plain = plain(ids, att, mpos, mmask, qtype, state_start=start)
+    l_plus, a_plus = plus(ids, att, mpos, mmask, qtype, state_start=start)
+check_true("residual/zero-init branch leaves the logits bit-identical to the shipped head",
+           torch.equal(l_plain, l_plus), "max |delta| = %r" % (l_plus - l_plain).abs().max().item())
+check_true("residual/zero-init branch leaves the act logits bit-identical too",
+           torch.equal(a_plain, a_plus))
+# The branch's head count is its own: the self-attention stage must keep the shipped 1-head
+# geometry here (d=64 -> max(1, 64//64) = 1) even though the branch runs 4 heads. Sharing one
+# `nhead` between the two stages loads the pre-trained weights without error and then computes a
+# different function, which is a silent change of the weights the arm claims to keep.
+check("residual/the branch has its own head count",
+      (plus.cross.branch.layers[0].cross_attn.num_heads, plus.head.layers[0].self_attn.num_heads),
+      (4, 1))
+check_true("residual/out_proj starts at exactly zero",
+           bool((plus.cross.out_proj.weight == 0).all() and (plus.cross.out_proj.bias == 0).all()))
+
+# ... and the branch is nevertheless *wired in*: a non-zero output projection must move the logits.
+# Without this the identity above would also hold for a branch that is silently not connected, which
+# is the failure mode that makes an "identity assertion" worthless.
+with torch.no_grad():
+    plus.cross.out_proj.weight.normal_(0, 1e-3)
+    l_probe, _ = plus(ids, att, mpos, mmask, qtype, state_start=start)
+check_true("residual/a non-zero out_proj moves the logits (branch is connected)",
+           not torch.allclose(l_plain, l_probe, atol=1e-6), "logits unchanged by a live branch")
+with torch.no_grad():
+    plus.cross.zero_init_out_proj()
+
+# The parallel branch must train. At step 0 the only non-zero gradients inside it are the output
+# projection's: `delta = W z + b` with `W = 0` gives `dL/dz = W^T dL/ddelta = 0`, so the stage first
+# learns a linear read-out of its random features and only then adapts those features. Asserting both
+# halves keeps that a checked property of the design rather than a surprise in the loss curve.
+m4 = _tiny("self_attention_plus_cross", cross_nhead=4)
+m4.train()
+out4, _ = m4(ids, att, mpos, mmask, qtype, state_start=start)
+out4.sum().backward()
+g4 = {n: (None if p.grad is None else float(p.grad.abs().sum()))
+      for n, p in m4.named_parameters() if p.requires_grad}
+check_true("residual/out_proj takes a non-zero gradient at step 0",
+           g4["cross.out_proj.weight"] and g4["cross.out_proj.bias"], str(g4["cross.out_proj.weight"]))
+check_true("residual/inside the branch the step-0 gradient is exactly zero (W = 0)",
+           all(g4["cross.branch.layers.%d.cross_attn.in_proj_weight" % i] == 0.0 for i in range(2))
+           and g4["cross.branch.layers.0.linear1.weight"] == 0.0)
+check_true("residual/self-attention half of the same model is a normal trainable head",
+           g4["head.layers.0.self_attn.in_proj_weight"] and g4["head.layers.0.linear1.weight"])
+
+# With the encoder frozen -- how every arm runs it -- the branch's keys/values are its *output*, so a
+# backward that reached the encoder through the branch would be a silent fine-tune of the backbone.
+m5 = _tiny("self_attention_plus_cross", cross_nhead=4)
+for p in m5.encoder.parameters():
+    p.requires_grad = False
+m5.train()
+m5(ids, att, mpos, mmask, qtype, state_start=start)[0].sum().backward()
+check_true("residual/a frozen encoder stays gradient-free through the branch",
+           all(p.grad is None for p in m5.encoder.parameters())
+           and float(m5.cross.out_proj.weight.grad.abs().sum()) > 0)
+
+opt = torch.optim.SGD([p for p in m4.parameters() if p.requires_grad], lr=1e-2)
+opt.step()
+m4.zero_grad(set_to_none=True)
+out4, _ = m4(ids, att, mpos, mmask, qtype, state_start=start)
+out4.sum().backward()
+check_true("residual/after one step the branch's own weights take non-zero gradients",
+           float(m4.cross.branch.layers[0].cross_attn.in_proj_weight.grad.abs().sum()) > 0
+           and float(m4.cross.branch.layers[1].linear1.weight.grad.abs().sum()) > 0)
+
+# The branch's *contribution* is measured within one model state: zero out_proj again and compare.
+# That isolates the branch from the rest of the head, which the same step also moved.
+m4.eval()
+with torch.no_grad():
+    l_with = m4(ids, att, mpos, mmask, qtype, state_start=start)[0]
+    m4.cross.zero_init_out_proj()
+    l_without = m4(ids, att, mpos, mmask, qtype, state_start=start)[0]
+check_true("residual/after one step the branch's contribution to the logits is non-zero",
+           not torch.allclose(l_with, l_without, atol=0.0),
+           "max |contribution| = %r" % (l_with - l_without).abs().max().item())
 
 print("\n%d passed, %d failed" % (len(PASS), len(FAIL)))
 for f in FAIL:

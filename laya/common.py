@@ -178,7 +178,41 @@ class CrossAttentionHead(nn.Module):
         return q
 
 
-HEAD_KINDS = ("self_attention", "cross_attention")
+class ResidualCrossAttention(nn.Module):
+    """A cross-attention stage whose output is **added** to the decision tokens, in parallel with
+    the shipped self-attention head -- the stage *augments* that head instead of replacing it.
+
+    ``out_proj`` is zero-initialised (weight *and* bias), so at initialisation this stage adds
+    exactly ``0`` and a model carrying it is **bit-for-bit** the model without it: adding a zero to
+    a finite activation is exact in IEEE-754, including the signed-zero cases. That is what makes a
+    win attributable to the architecture rather than to the branch's initialisation, and
+    ``experiments/h5-adapter/step0.py`` asserts it against the arm that has no branch.
+
+    Only the output projection starts at zero: the attention, the feed-forward and both norms inside
+    ``branch`` keep their ordinary initialisation, and the first backward pass gives every one of
+    them a non-zero gradient through ``out_proj``, so the stage is trainable from step 0 rather than
+    merely inert.
+    """
+
+    def __init__(self, d_model: int, nhead: int, dim_feedforward: int, num_layers: int,
+                 dropout: float = 0.1):
+        super().__init__()
+        self.branch = CrossAttentionHead(d_model, nhead, dim_feedforward, num_layers, dropout)
+        self.out_proj = nn.Linear(d_model, d_model)
+        self.zero_init_out_proj()
+
+    def zero_init_out_proj(self) -> None:
+        """The identity-at-init property, in one place so the assertion and the initialisation
+        cannot drift apart."""
+        nn.init.zeros_(self.out_proj.weight)
+        nn.init.zeros_(self.out_proj.bias)
+
+    def forward(self, q: torch.Tensor, kv: torch.Tensor,
+                kv_pad_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        return self.out_proj(self.branch(q, kv, kv_pad_mask))
+
+
+HEAD_KINDS = ("self_attention", "cross_attention", "self_attention_plus_cross")
 
 
 class DecisionModel(nn.Module):
@@ -194,13 +228,20 @@ class DecisionModel(nn.Module):
                            encoded state token is a key/value pair, so each marker reaches all
                            ``n`` state positions in one hop instead of routing through the head's
                            layers while competing with the filler for attention mass.
+    ``"self_attention_plus_cross"``
+                           the shipped self-attention head **kept**, plus a
+                           ``ResidualCrossAttention`` branch reading the same input whose output is
+                           added to the decision tokens. The branch's output projection is
+                           zero-initialised, so the model starts out identical to
+                           ``"self_attention"`` and the branch is a pure additive correction.
 
     Only the aggregation changes. ``type_emb``, ``scorer``, ``act_head`` and ``temperature`` are
     the same modules in both, and the marker gather and scoring path below is untouched.
     """
 
     def __init__(self, encoder: nn.Module, head_layers: int = 2, n_act: int = 2, dropout: float = 0.1,
-                 head_kind: str = "self_attention", head_nhead: Optional[int] = None):
+                 head_kind: str = "self_attention", head_nhead: Optional[int] = None,
+                 cross_nhead: Optional[int] = None):
         super().__init__()
         if head_kind not in HEAD_KINDS:
             raise ValueError("head_kind must be one of %s, got %r" % (HEAD_KINDS, head_kind))
@@ -208,11 +249,19 @@ class DecisionModel(nn.Module):
         self.head_kind = head_kind
         d = encoder.config.hidden_size
         nhead = head_nhead or max(1, d // 64)
-        if head_kind == "self_attention":
+        # The parallel branch has its *own* head count. The shipped self-attention stage's head
+        # count is not a free parameter: `in_proj_weight` has the same shape for any head count, so
+        # getting it wrong loads the pre-trained weights without error and then computes a different
+        # function -- a silent change of the very weights the arm claims to keep.
+        self.cross_nhead = cross_nhead or nhead
+        self.cross = None
+        if head_kind == "cross_attention":
+            self.head = CrossAttentionHead(d, nhead, 4 * d, head_layers, dropout) if head_layers > 0 else None
+        else:
             layer = nn.TransformerEncoderLayer(d, nhead, 4 * d, dropout, batch_first=True, norm_first=True)
             self.head = nn.TransformerEncoder(layer, head_layers, enable_nested_tensor=False) if head_layers > 0 else None
-        else:
-            self.head = CrossAttentionHead(d, nhead, 4 * d, head_layers, dropout) if head_layers > 0 else None
+            if head_kind == "self_attention_plus_cross" and head_layers > 0:
+                self.cross = ResidualCrossAttention(d, self.cross_nhead, 4 * d, head_layers, dropout)
         self.type_emb = nn.Embedding(3, d)
         self.scorer = nn.Sequential(nn.LayerNorm(d), nn.Linear(d, d), nn.GELU(), nn.Linear(d, 1))
         self.act_head = nn.Sequential(nn.Linear(d + 4, 256), nn.GELU(), nn.Linear(256, n_act))
@@ -244,13 +293,24 @@ class DecisionModel(nn.Module):
         return (first + 1).clamp(max=input_ids.size(1))
 
     def forward(self, input_ids, attention_mask, marker_pos, marker_mask, qtype,
-                detach_encoder: bool = False, state_start: Optional[torch.Tensor] = None):
-        h = self.encoder(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state
-        if detach_encoder:
-            h = h.detach()
+                detach_encoder: bool = False, state_start: Optional[torch.Tensor] = None,
+                encoder_hidden: Optional[torch.Tensor] = None):
+        """``encoder_hidden`` lets a caller that has already run the frozen encoder once -- and
+        cached its output -- reuse this exact head path instead of re-deriving it, which is what
+        keeps a from-cached-features training loop measuring the same aggregation the model
+        actually ships. The encoder is skipped when it is supplied, and ``input_ids`` is then only
+        used by the ``state_start`` fallback.
+        """
+        if encoder_hidden is None:
+            h = self.encoder(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state
+            if detach_encoder:
+                h = h.detach()
+        else:
+            h = encoder_hidden
         h = h + self.type_emb(qtype)[:, None, :]
         pad = ~attention_mask.bool()
-        if self.head is not None and self.head_kind == "self_attention":
+        h_in = h
+        if self.head is not None and self.head_kind != "cross_attention":
             for layer in self.head.layers:
                 if self.head_checkpointing and self.training and torch.is_grad_enabled():
                     # Non-reentrant checkpointing also trains the head when its input
@@ -271,6 +331,17 @@ class DecisionModel(nn.Module):
             # padded query block back is safe: positions at or past state_start are state tokens
             # that the marker gather below never reads.
             h = torch.cat([q, h[:, dmax:]], dim=1)
+        if self.cross is not None:
+            # The parallel branch: same input as the self-attention stage above, added to the
+            # decision positions only. ``out_proj`` is zero-initialised, so ``delta`` is exactly
+            # zero at initialisation and this line is the identity on ``h``.
+            start = self._state_start(input_ids, marker_pos, marker_mask, state_start)
+            dmax = int(start.max().item())
+            pos = torch.arange(h_in.size(1), device=h_in.device)[None, :]
+            kv_pad = pad | (pos < start[:, None])
+            delta = self.cross(h_in[:, :dmax], h_in, kv_pad)
+            delta = delta * (pos[:, :dmax] < start[:, None]).unsqueeze(-1)
+            h = torch.cat([h[:, :dmax] + delta, h[:, dmax:]], dim=1)
         idx = marker_pos.clamp(min=0)[:, :, None].expand(-1, -1, h.size(-1))
         m = torch.gather(h, 1, idx)
         logits = self.scorer(m).squeeze(-1).float()
